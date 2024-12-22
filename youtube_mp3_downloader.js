@@ -5,8 +5,14 @@
 // @description  Simple YouTube to MP3 converter with clean interface
 // @match        https://www.youtube.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        unsafeWindow
 // @connect      loader.to
 // @connect      p.oceansaver.in
+// @connect      *
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -241,10 +247,12 @@
     }
 
     // 开始下载
-    function startDownload(videoId, progressBar, info, button) {
+    function startDownload(videoId, progressBar, info, button, retryCount = 0) {
+        const MAX_RETRIES = 3;
+        
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
         const API_KEY = 'a4016fa228909c2bd7cb02037ca2a34c815d03a7';
-
+        
         button.disabled = true;
         button.textContent = 'Preparing...';
         progressBar.parentElement.style.display = 'block';
@@ -275,16 +283,35 @@
                 }
             },
             onerror: function(error) {
-                info.textContent = 'Network error: ' + (error.message || 'Connection failed');
-                button.textContent = 'Retry';
-                button.disabled = false;
+                if (retryCount < MAX_RETRIES) {
+                    info.textContent = `Retry attempt ${retryCount + 1}/${MAX_RETRIES}...`;
+                    setTimeout(() => {
+                        startDownload(videoId, progressBar, info, button, retryCount + 1);
+                    }, 2000 * (retryCount + 1)); // 递增重试延迟
+                } else {
+                    info.textContent = 'Network error: ' + (error.message || 'Connection failed');
+                    button.textContent = 'Retry';
+                    button.disabled = false;
+                }
             }
         });
     }
 
     // 检查下载进度
     function checkProgress(downloadId, progressBar, info, button) {
+        let pollInterval = 1000; // 开始是1秒
+        let consecutiveErrors = 0;
+        let lastProgress = 0;
+        let stallCount = 0;
+        
         const progressCheck = setInterval(() => {
+            // 如果连续错误超过3次，增加轮询间隔
+            if (consecutiveErrors > 3) {
+                pollInterval = Math.min(pollInterval * 1.5, 5000); // 最大5秒
+                clearInterval(progressCheck);
+                setInterval(progressCheck, pollInterval);
+            }
+            
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: `https://p.oceansaver.in/ajax/progress.php?id=${downloadId}`,
@@ -296,13 +323,27 @@
                     try {
                         const data = JSON.parse(response.responseText);
                         if (!data) {
-                            clearInterval(progressCheck);
-                            info.textContent = 'Error: Invalid response';
-                            button.textContent = 'Retry';
-                            button.disabled = false;
+                            console.error('Invalid response data:', response.responseText);
+                            throw new Error('Invalid response data');
+                        }
+                        
+                        if (data && data.progress === lastProgress) {
+                            stallCount++;
+                            if (stallCount > 5) {
+                                info.textContent += ' (Slow connection detected)';
+                            }
+                        } else {
+                            stallCount = 0;
+                        }
+                        lastProgress = data ? data.progress : 0;
+                        
+                        // 检查progress是否为有效数值
+                        if (typeof data.progress !== 'number') {
+                            console.error('Invalid progress value:', data.progress);
+                            info.textContent = 'Invalid progress data';
                             return;
                         }
-
+                        
                         const percent = (data.progress / 10).toFixed(1);
                         progressBar.style.width = `${percent}%`;
                         info.textContent = data.text || `Converting: ${percent}%`;
@@ -313,14 +354,54 @@
                             button.textContent = 'Download MP3';
                             button.disabled = false;
                             button.onclick = () => {
-                                window.location.href = data.download_url;
+                                // 获取视频标题
+                                const videoTitle = document.querySelector('h1.style-scope.ytd-watch-metadata')?.textContent?.trim() || 'youtube_video';
+                                // 清理并编码文件名
+                                const cleanTitle = encodeURIComponent(
+                                    videoTitle
+                                        .replace(/[\\/:*?"<>|]/g, '')
+                                        .replace(/\s+/g, '_')
+                                );
+                                
+                                // 使用GM_xmlhttpRequest下载文件
+                                GM_xmlhttpRequest({
+                                    method: 'GET',
+                                    url: data.download_url,
+                                    responseType: 'blob',
+                                    onload: function(response) {
+                                        const blob = new Blob([response.response], { type: 'audio/mpeg' });
+                                        const url = URL.createObjectURL(blob);
+                                        const downloadLink = document.createElement('a');
+                                        downloadLink.href = url;
+                                        downloadLink.download = `${decodeURIComponent(cleanTitle)}.mp3`;
+                                        downloadLink.style.display = 'none';
+                                        document.body.appendChild(downloadLink);
+                                        downloadLink.click();
+                                        document.body.removeChild(downloadLink);
+                                        URL.revokeObjectURL(url);
+                                    },
+                                    onerror: function() {
+                                        info.textContent = 'Download failed';
+                                        button.textContent = 'Retry';
+                                        button.disabled = false;
+                                    }
+                                });
                             };
                         }
                     } catch (error) {
-                        clearInterval(progressCheck);
-                        info.textContent = 'Error occurred';
-                        button.textContent = 'Retry';
-                        button.disabled = false;
+                        console.error('Progress check error:', error);
+                        console.error('Response text:', response.responseText);
+                        consecutiveErrors++;
+                        
+                        if (consecutiveErrors > 3) {
+                            clearInterval(progressCheck);
+                            info.textContent = `Error: ${error.message}`;
+                            button.textContent = 'Retry';
+                            button.disabled = false;
+                            button.onclick = () => startDownload(videoId, progressBar, info, button);
+                        } else {
+                            info.textContent = `Retrying... (${consecutiveErrors}/3)`;
+                        }
                     }
                 },
                 onerror: function() {
@@ -330,7 +411,7 @@
                     button.disabled = false;
                 }
             });
-        }, 1000);
+        }, pollInterval);
     }
 
     // 初始化脚本
